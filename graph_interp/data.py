@@ -1,8 +1,10 @@
 """Dataset loading and Graphormer batch building from SMILES strings."""
 
+import csv
+import gzip
 import numpy as np
 import torch
-from ogb.lsc import PCQM4Mv2Dataset
+from pathlib import Path
 from ogb.utils import smiles2graph
 
 from .config import MAX_DIST, DEFAULT_POOL_SIZE
@@ -12,6 +14,8 @@ from .config import MAX_DIST, DEFAULT_POOL_SIZE
 
 def load_dataset(root: str = "pcqm4mv2"):
     """Load PCQM4Mv2 dataset (SMILES-only when possible)."""
+    from ogb.lsc import PCQM4Mv2Dataset
+
     try:
         ds = PCQM4Mv2Dataset(root=root, only_smiles=True)
     except TypeError:
@@ -39,6 +43,75 @@ def load_smiles_pool(ds=None, pool_size: int = DEFAULT_POOL_SIZE, root: str = "p
     if ds is None:
         ds = load_dataset(root=root)
     return [get_smiles(ds, i) for i in range(min(pool_size, len(ds)))]
+
+
+def load_molhiv_dataset(root: str = "dataset"):
+    """Load the OGBG-MolHIV graph property dataset."""
+    from ogb.graphproppred import GraphPropPredDataset
+
+    return GraphPropPredDataset(name="ogbg-molhiv", root=root)
+
+
+def _read_smiles_mapping(path: Path) -> list[str]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError(f"Mapping file has no header: {path}")
+        smiles_key = next(
+            (key for key in reader.fieldnames if key.lower() in {"smiles", "smi"}),
+            None,
+        )
+        if smiles_key is None:
+            raise ValueError(f"No SMILES column found in {path}; fields={reader.fieldnames}")
+        return [row[smiles_key] for row in reader]
+
+
+def _find_molhiv_smiles_mapping(root: str | Path) -> Path:
+    root = Path(root)
+    candidates = [
+        root / "ogbg_molhiv" / "mapping" / "mol.csv.gz",
+        root / "ogbg_molhiv" / "mapping" / "mol.csv",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    matches = sorted(root.rglob("mol.csv*"))
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(f"Could not find OGBG-MolHIV mol.csv mapping under {root}")
+
+
+def _as_index_list(indices) -> list[int]:
+    if hasattr(indices, "detach"):
+        indices = indices.detach().cpu()
+    if hasattr(indices, "numpy"):
+        indices = indices.numpy()
+    if hasattr(indices, "tolist"):
+        indices = indices.tolist()
+    return [int(i) for i in indices]
+
+
+def load_molhiv_smiles_pool(
+    root: str = "dataset",
+    split: str = "train",
+    pool_size: int = DEFAULT_POOL_SIZE,
+) -> list[str]:
+    """Return SMILES strings from an OGBG-MolHIV split.
+
+    The existing figure pipeline consumes SMILES strings and builds Graphormer
+    batches from them. OGBG-MolHIV stores the original SMILES in its mapping
+    file, so this loader keeps the analysis input matched to the fine-tuning
+    dataset instead of reusing PCQM molecules.
+    """
+    ds = load_molhiv_dataset(root=root)
+    split_idx = ds.get_idx_split()
+    if split not in split_idx:
+        raise KeyError(f"Unknown MolHIV split {split!r}; available={sorted(split_idx)}")
+    smiles = _read_smiles_mapping(_find_molhiv_smiles_mapping(root))
+    indices = _as_index_list(split_idx[split])
+    selected = [smiles[i] for i in indices[: min(pool_size, len(indices))]]
+    return selected
 
 
 # ── Batch building internals ─────────────────────────────────

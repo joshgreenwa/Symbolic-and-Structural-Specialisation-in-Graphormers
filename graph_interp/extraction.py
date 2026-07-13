@@ -1,6 +1,7 @@
 """Model loading and attention / hidden-state extraction (with optional ablation)."""
 
 import math
+from pathlib import Path
 import numpy as np
 import torch
 from transformers import GraphormerForGraphClassification
@@ -19,6 +20,176 @@ def load_model(device: torch.device | str = "cuda"):
     )
     model = clf.encoder.to(device).eval()
     return model, device
+
+
+def _resolve_checkpoint_path(
+    checkpoint_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+    ckpt_dir: str | Path | None = None,
+) -> Path:
+    """Resolve a MolHIV Fairseq checkpoint path from a file, run dir, or ckpt dir."""
+    if checkpoint_path is not None:
+        path = Path(checkpoint_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: {path}")
+        return path
+
+    if ckpt_dir is None:
+        if run_dir is None:
+            candidates = [
+                Path("/content/drive/MyDrive/graphormer_molhiv_runs")
+                / "official_molhiv_pcqm4mv1_graphormer_base_for_molhiv_seed1",
+                Path("/content/graphormer_molhiv_runs")
+                / "official_molhiv_pcqm4mv1_graphormer_base_for_molhiv_seed1",
+                Path("/content/drive/MyDrive/graphormer_molhiv_runs")
+                / "official_molhiv_pcqm4mv1_graphormer_base_seed1",
+                Path("/content/graphormer_molhiv_runs")
+                / "official_molhiv_pcqm4mv1_graphormer_base_seed1",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    run_dir = candidate
+                    break
+        if run_dir is None:
+            raise FileNotFoundError(
+                "Provide checkpoint_path, run_dir, or ckpt_dir for the MolHIV checkpoint."
+            )
+        ckpt_dir = Path(run_dir).expanduser() / "ckpts"
+    else:
+        ckpt_dir = Path(ckpt_dir).expanduser()
+
+    preferred = [
+        ckpt_dir / "checkpoint_best_valid_auc.pt",
+        ckpt_dir / "checkpoint_best.pt",
+        ckpt_dir / "checkpoint_last.pt",
+    ]
+    for path in preferred:
+        if path.is_file():
+            return path
+
+    checkpoints = sorted(
+        (
+            path
+            for path in ckpt_dir.glob("checkpoint*.pt")
+            if "pretrained_step0" not in path.name
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if checkpoints:
+        return checkpoints[0]
+    raise FileNotFoundError(f"No checkpoint*.pt files found in {ckpt_dir}")
+
+
+def _fairseq_encoder_state(checkpoint: dict) -> dict[str, torch.Tensor]:
+    """Convert official Fairseq Graphormer checkpoint keys to HF encoder keys."""
+    state = checkpoint.get("model", checkpoint)
+    if not isinstance(state, dict):
+        raise TypeError(f"Expected a checkpoint dict or model state dict, got {type(state)}")
+
+    encoder_state = {}
+    for key, value in state.items():
+        if key.startswith("encoder."):
+            encoder_state[key[len("encoder.") :]] = value
+    if not encoder_state:
+        raise RuntimeError("No 'encoder.' keys found in checkpoint model state.")
+    return encoder_state
+
+
+def _lookup_nested(obj, path: tuple[str, ...]):
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def _infer_pre_layernorm(checkpoint: dict, checkpoint_path: Path) -> bool:
+    for path in (
+        ("cfg", "model", "pre_layernorm"),
+        ("args", "pre_layernorm"),
+        ("extra_state", "pre_layernorm"),
+    ):
+        value = _lookup_nested(checkpoint, path)
+        if value is not None:
+            return bool(value)
+    return "base_for_molhiv" in str(checkpoint_path)
+
+
+def _set_pre_layernorm(model, enabled: bool) -> None:
+    if hasattr(model, "config"):
+        setattr(model.config, "pre_layernorm", enabled)
+    graph_encoder = getattr(model, "graph_encoder", None)
+    if graph_encoder is not None:
+        for layer in getattr(graph_encoder, "layers", []):
+            if hasattr(layer, "pre_layernorm"):
+                layer.pre_layernorm = enabled
+
+
+def load_molhiv_model(
+    checkpoint_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+    ckpt_dir: str | Path | None = None,
+    device: torch.device | str = "cuda",
+    base_model_id: str = MODEL_ID,
+    base_revision: str = MODEL_REVISION,
+):
+    """Load a MolHIV fine-tuned Fairseq checkpoint into the HF Graphormer encoder.
+
+    Returns:
+        (model, device, checkpoint_path)
+
+    The existing analysis code operates on the Hugging Face encoder object. The
+    MolHIV training run saves official Microsoft/Fairseq checkpoints, whose keys
+    are prefixed with ``encoder.``. This function instantiates the same HF
+    Graphormer encoder used by the PCQM analysis, strips that prefix, and loads
+    all shape-compatible encoder weights from the MolHIV checkpoint.
+    """
+    if isinstance(device, str):
+        device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+    checkpoint_path = _resolve_checkpoint_path(checkpoint_path, run_dir, ckpt_dir)
+    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    encoder_state = _fairseq_encoder_state(checkpoint)
+    pre_layernorm = _infer_pre_layernorm(checkpoint, checkpoint_path)
+
+    clf, _ = GraphormerForGraphClassification.from_pretrained(
+        base_model_id,
+        revision=base_revision,
+        use_safetensors=True,
+        output_loading_info=True,
+    )
+    model = clf.encoder
+    _set_pre_layernorm(model, pre_layernorm)
+
+    target_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    for key, value in encoder_state.items():
+        if key in target_state and tuple(target_state[key].shape) == tuple(value.shape):
+            compatible_state[key] = value
+        else:
+            skipped.append(key)
+
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    critical_missing = [
+        key for key in missing if key.startswith("graph_encoder.") and "embed_out" not in key
+    ]
+    if critical_missing:
+        preview = ", ".join(critical_missing[:8])
+        raise RuntimeError(f"Missing critical graph encoder keys after load: {preview}")
+    if unexpected:
+        preview = ", ".join(unexpected[:8])
+        raise RuntimeError(f"Unexpected keys while loading MolHIV checkpoint: {preview}")
+    if skipped:
+        print(f"Skipped {len(skipped)} shape-mismatched/non-encoder keys; first few: {skipped[:5]}")
+
+    model = model.to(device).eval()
+    return model, device, checkpoint_path
 
 
 # ── Internal: shared forward-pass preamble ───────────────────
