@@ -59,6 +59,10 @@ def _bootstrap_colab() -> None:
         repo_dir = COLAB_REPO
 
     if _running_in_colab():
+        from google.colab import drive
+
+        drive.mount("/content/drive", force_remount=False)
+
         # Preserve Colab's already-loaded NumPy/Torch ABI. Installing the repository's
         # full lock file here would replace NumPy in a live kernel and require a restart.
         marker = Path("/content/.graphormer_transport_comparison_deps_v3")
@@ -83,6 +87,12 @@ def _bootstrap_colab() -> None:
 
 
 _bootstrap_colab()
+
+DEFAULT_OUTPUT_DIR = (
+    "/content/drive/MyDrive/graphormer_transport_comparison"
+    if _running_in_colab()
+    else "./graphormer_transport_comparison"
+)
 
 import matplotlib
 
@@ -111,7 +121,7 @@ class ComparisonConfig:
     ablation_head_chunk: int = 16
     seed: int = 42
     verification_tol: float = 5e-4
-    output_dir: str = "/content/graphormer_transport_comparison"
+    output_dir: str = DEFAULT_OUTPUT_DIR
     device: str = "cuda"
 
 
@@ -943,7 +953,7 @@ def parse_args(argv: list[str] | None = None) -> ComparisonConfig:
     parser.add_argument("--ablation-head-chunk", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verification-tol", type=float, default=5e-4)
-    parser.add_argument("--output-dir", default="/content/graphormer_transport_comparison")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     if argv is None:
         args, _ = parser.parse_known_args()
