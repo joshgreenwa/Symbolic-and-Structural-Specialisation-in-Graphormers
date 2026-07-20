@@ -22,7 +22,6 @@ import argparse
 import importlib.util
 import json
 import os
-import signal
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -60,26 +59,26 @@ def _bootstrap_colab() -> None:
         repo_dir = COLAB_REPO
 
     if _running_in_colab():
-        # Installing NumPy/Torch into a live Colab kernel can leave already-loaded
-        # extension modules bound to the old ABI. Use a versioned marker and restart
-        # exactly once after installation; the next execution imports a clean stack.
-        marker = Path("/content/.graphormer_transport_comparison_deps_v2")
+        # Preserve Colab's already-loaded NumPy/Torch ABI. Installing the repository's
+        # full lock file here would replace NumPy in a live kernel and require a restart.
+        marker = Path("/content/.graphormer_transport_comparison_deps_v3")
         if not marker.exists():
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", str(repo_dir / "requirements.lock.txt")],
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "transformers==4.40.2",
+                    "tokenizers==0.19.1",
+                    "huggingface-hub==0.36.1",
+                    "ogb==1.3.6",
+                    "rdkit",
+                ],
                 check=True,
             )
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-i", "https://pypi.org/simple", "rdkit"],
-                check=True,
-            )
-            marker.write_text(str(os.getpid()), encoding="utf-8")
-            print(
-                "Dependencies installed. Restarting the Colab runtime to activate the consistent NumPy/Torch ABI; "
-                "rerun this cell once the runtime reconnects.",
-                flush=True,
-            )
-            os.kill(os.getpid(), signal.SIGKILL)
+            marker.touch()
+            print("Graphormer dependencies installed; continuing without a runtime restart.", flush=True)
     sys.path.insert(0, str(repo_dir))
 
 
@@ -946,7 +945,10 @@ def parse_args(argv: list[str] | None = None) -> ComparisonConfig:
     parser.add_argument("--verification-tol", type=float, default=5e-4)
     parser.add_argument("--output-dir", default="/content/graphormer_transport_comparison")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    args = parser.parse_args(argv)
+    if argv is None:
+        args, _ = parser.parse_known_args()
+    else:
+        args = parser.parse_args(argv)
     return ComparisonConfig(
         num_graphs=args.num_graphs,
         donors=args.donors,
