@@ -14,6 +14,7 @@ pip install -r requirements.lock.txt
 
 - Open [`generate_figures.ipynb`](generate_figures.ipynb) to run the figure-generation pipeline.
 - Open [`generate_molhiv_figures.ipynb`](generate_molhiv_figures.ipynb) to run the same figure pipeline on a fine-tuned OGBG-MolHIV checkpoint.
+- Run [`colab/graphormer_transport_specialisation_comparison.py`](colab/graphormer_transport_specialisation_comparison.py) in Colab to compare the current key-permutation scores with separate semantic/structural interventions scored by downstream per-head transport, including method-alignment and head-ablation tests.
 
 ## Package
 

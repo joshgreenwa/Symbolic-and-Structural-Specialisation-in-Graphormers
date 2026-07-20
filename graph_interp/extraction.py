@@ -38,6 +38,14 @@ def _resolve_checkpoint_path(
         if run_dir is None:
             candidates = [
                 Path("/content/drive/MyDrive/graphormer_molhiv_runs")
+                / "public_pcqm_molhiv_pcqm4mv2_graphormer_base_seed1",
+                Path("/content/graphormer_molhiv_runs")
+                / "public_pcqm_molhiv_pcqm4mv2_graphormer_base_seed1",
+                Path("/content/drive/MyDrive/graphormer_molhiv_runs")
+                / "public_pcqm_molhiv_pcqm4mv1_graphormer_base_seed1",
+                Path("/content/graphormer_molhiv_runs")
+                / "public_pcqm_molhiv_pcqm4mv1_graphormer_base_seed1",
+                Path("/content/drive/MyDrive/graphormer_molhiv_runs")
                 / "official_molhiv_pcqm4mv1_graphormer_base_for_molhiv_seed1",
                 Path("/content/graphormer_molhiv_runs")
                 / "official_molhiv_pcqm4mv1_graphormer_base_for_molhiv_seed1",

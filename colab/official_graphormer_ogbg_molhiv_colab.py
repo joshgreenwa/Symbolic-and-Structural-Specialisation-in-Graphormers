@@ -15,8 +15,24 @@ That stack is intentionally separate from the official Microsoft Fairseq
 training stack below. Set RUN_ANALYSIS_PCQM_SMOKE_TEST=1 to run the same
 analysis-style PCQM load check before training.
 
-Defaults target Microsoft's official OGBG-MolHIV reproduction script
-(`examples/property_prediction/hiv_pre.sh`) for the reported Graphormer result:
+Default runs target maximum OGBG-MolHIV AUC with the strongest public
+Graphormer starting point available to this project: PCQM4Mv2. Microsoft's
+actual `hiv_pre.sh` reproduction requires a
+MolHIV-specific checkpoint that is listed in public registries but whose Azure
+Blob URL is no longer publicly resolvable from current runtimes. The exact
+Microsoft mode is therefore opt-in and will fail fast unless that checkpoint is
+actually present in Drive/local cache.
+
+Max-AUC public defaults:
+  - Graphormer base, 12 layers, 768 hidden, 32 heads
+  - Public PCQM4Mv2 checkpoint: pcqm4mv2_graphormer_base
+  - Pre-layernorm disabled because public PCQM checkpoints are not pre-layernorm checkpoints
+  - MolHIV fine-tune: 20 epochs, LR 2e-4, effective batch 128
+  - warmup ratio 0.16, end LR 1e-5, Adam eps 1e-8, clip norm 5.0, weight decay 0
+  - dropout 0.0, attention dropout 0.1, activation dropout 0.1
+  - FLAG m=3, step size 0.01, magnitude 0
+
+Exact Microsoft `hiv_pre.sh` mode:
   - Graphormer base, 12 layers, 768 hidden, 32 heads
   - MolHIV-specific public checkpoint: pcqm4mv1_graphormer_base_for_molhiv
   - Pre-layernorm enabled
@@ -25,18 +41,31 @@ Defaults target Microsoft's official OGBG-MolHIV reproduction script
   - dropout 0.0, attention dropout 0.1, activation dropout 0.1
   - FLAG m=3, step size 0.01, magnitude 0
 
-By default this runner uses the literal Microsoft batch implementation:
-MICRO_BATCH_SIZE=128 and UPDATE_FREQ=1. If a Colab GPU runs out of memory, set
-EXACT_PAPER_BATCH=0 and MICRO_BATCH_SIZE=32 / UPDATE_FREQ=4; that preserves the
-effective batch size but is no longer a byte-for-byte match to hiv_pre.sh.
+By default this runner uses a Colab-safe batch implementation:
+MICRO_BATCH_SIZE=32 and UPDATE_FREQ=4, preserving effective batch size 128. In
+exact Microsoft mode it uses the literal script batch, MICRO_BATCH_SIZE=128 and
+UPDATE_FREQ=1.
 
-Strict Microsoft alignment is enforced by default. Critical stale environment
-overrides are ignored while STRICT_MICROSOFT_CONFIG=1 and the run fails fast if
-the effective configuration drifts. The older NeurIPS paper table recipe remains
-available only by setting CONFIG_PRESET=paper_table and STRICT_MICROSOFT_CONFIG=0.
+Strict Microsoft alignment is available only with CONFIG_PRESET=microsoft_hiv_pre.
+Critical stale environment overrides are ignored while STRICT_MICROSOFT_CONFIG=1
+and the run fails fast if the effective configuration drifts. The older NeurIPS
+paper table recipe remains available by setting CONFIG_PRESET=paper_table.
 
 Useful environment overrides before running:
-  # Microsoft hiv_pre.sh defaults:
+  # Max-AUC public defaults:
+  CONFIG_PRESET=public_pcqm_hiv_pre
+  PRETRAINED_MODEL_NAME=pcqm4mv2_graphormer_base
+  PRE_LAYERNORM_ARG=
+  PAPER_EPOCHS=20
+  WARMUP_RATIO=0.16
+  WARMUP_RATIO_PERCENT=16
+  END_LEARNING_RATE=1e-5
+  DROPOUT=0.0
+  FLAG_M=3
+  FLAG_STEP_SIZE=0.01
+  FLAG_MAG=0
+
+  # Exact Microsoft hiv_pre.sh mode, only if the checkpoint is available:
   CONFIG_PRESET=microsoft_hiv_pre
   STRICT_MICROSOFT_CONFIG=1
   EXACT_PAPER_BATCH=1
@@ -52,9 +81,9 @@ Useful environment overrides before running:
   FLAG_MAG=0
   PRE_LAYERNORM_ARG=--pre-layernorm
 
-  # Analysis-checkpoint variant:
+  # Backup comparison only if PCQM4Mv2 underperforms:
   STRICT_MICROSOFT_CONFIG=0
-  PRETRAINED_MODEL_NAME=pcqm4mv2_graphormer_base
+  PRETRAINED_MODEL_NAME=pcqm4mv1_graphormer_base
 
   SEEDS=1,2,3
   MICRO_BATCH_SIZE=32
@@ -70,6 +99,7 @@ Useful environment overrides before running:
   TORCH_HOME=/content/graphormer_molhiv_runs/_torch_home
   PRETRAINED_CACHE_DRIVE=/content/drive/MyDrive/graphormer_molhiv_runs/_pretrained_cache
   MOLHIV_PRETRAINED_URL=https://ml2md.blob.core.windows.net/graphormer-ckpts/checkpoint_base_preln_pcqm4mv1_for_hiv.pt
+  MOLHIV_PRETRAINED_LOCAL_PATH=/content/drive/MyDrive/graphormer_molhiv_runs/_pretrained_cache/checkpoint_base_preln_pcqm4mv1_for_hiv.pt
   HF_PCQM4MV1_PYTORCH_URL=https://huggingface.co/clefourrier/graphormer-base-pcqm4mv1/resolve/main/pytorch_model.bin
   HF_PCQM4MV2_PYTORCH_URL=https://huggingface.co/clefourrier/graphormer-base-pcqm4mv2/resolve/refs%2Fpr%2F4/pytorch_model.bin
   RUN_ANALYSIS_PCQM_SMOKE_TEST=1
@@ -95,8 +125,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import urllib.request
 from collections import deque
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -180,17 +212,35 @@ HF_PCQM4MV2_PYTORCH_URL = os.environ.get(
     "https"
     + "://huggingface.co/clefourrier/graphormer-base-pcqm4mv2/resolve/refs%2Fpr%2F4/pytorch_model.bin",
 )
+MOLHIV_PRETRAINED_CANONICAL_FILENAME = "checkpoint_base_preln_pcqm4mv1_for_hiv.pt"
+MOLHIV_PRETRAINED_URL = os.environ.get(
+    "MOLHIV_PRETRAINED_URL",
+    "https"
+    + "://ml2md.blob.core.windows.net/graphormer-ckpts/"
+    + MOLHIV_PRETRAINED_CANONICAL_FILENAME,
+)
+MOLHIV_PRETRAINED_ALT_URLS = os.environ.get(
+    "MOLHIV_PRETRAINED_ALT_URLS",
+    "https"
+    + "://szheng.blob.core.windows.net/graphormer/modelzoo/pcqm4mv1/"
+    + MOLHIV_PRETRAINED_CANONICAL_FILENAME,
+)
+MICROSOFT_PRESETS = {"microsoft_hiv_pre", "official_hiv_pre", "official_molhiv"}
+PUBLIC_PCQM_PRESETS = {"public_hiv_pre_fallback", "public_pcqm_hiv_pre", "pcqm_hiv_pre"}
+PAPER_TABLE_PRESETS = {"paper_table", "neurips_paper_table", "paper"}
+MOLHIV_PRETRAINED_LOCAL_PATH = os.environ.get("MOLHIV_PRETRAINED_LOCAL_PATH", "")
+PRETRAINED_MODEL_URL_OVERRIDE = os.environ.get("PRETRAINED_MODEL_URL_OVERRIDE", "")
+SKIP_PRETRAINED_SOURCE_PREFLIGHT = env_bool("SKIP_PRETRAINED_SOURCE_PREFLIGHT", False)
 
 
 CONFIG_PRESET = os.environ.get(
-    "CONFIG_PRESET", os.environ.get("REPRODUCTION_CONFIG", "microsoft_hiv_pre")
+    "CONFIG_PRESET", os.environ.get("REPRODUCTION_CONFIG", "public_pcqm_hiv_pre")
 ).strip().lower()
-STRICT_MICROSOFT_CONFIG = env_bool("STRICT_MICROSOFT_CONFIG", True)
+STRICT_MICROSOFT_CONFIG = env_bool(
+    "STRICT_MICROSOFT_CONFIG", CONFIG_PRESET in MICROSOFT_PRESETS
+)
 EXACT_PAPER_CONFIG = env_bool("EXACT_PAPER_CONFIG", False)
-EXACT_PAPER_BATCH = env_bool("EXACT_PAPER_BATCH", True)
-
-MICROSOFT_PRESETS = {"microsoft_hiv_pre", "official_hiv_pre", "official_molhiv"}
-PAPER_TABLE_PRESETS = {"paper_table", "neurips_paper_table", "paper"}
+EXACT_PAPER_BATCH = env_bool("EXACT_PAPER_BATCH", CONFIG_PRESET in MICROSOFT_PRESETS)
 
 
 def using_microsoft_hiv_pre() -> bool:
@@ -199,6 +249,10 @@ def using_microsoft_hiv_pre() -> bool:
 
 def using_paper_table() -> bool:
     return CONFIG_PRESET in PAPER_TABLE_PRESETS
+
+
+def using_public_pcqm_hiv_pre() -> bool:
+    return CONFIG_PRESET in PUBLIC_PCQM_PRESETS
 
 
 def config_value(
@@ -212,6 +266,8 @@ def config_value(
         if STRICT_MICROSOFT_CONFIG:
             return microsoft_default
         return os.environ.get(name, microsoft_default)
+    if using_public_pcqm_hiv_pre():
+        return os.environ.get(name, fallback_default)
     if using_paper_table() and EXACT_PAPER_CONFIG:
         return paper_table_default
     return os.environ.get(name, fallback_default)
@@ -227,6 +283,8 @@ def batch_value(
         if STRICT_MICROSOFT_CONFIG:
             return microsoft_default
         return os.environ.get(name, microsoft_default if EXACT_PAPER_BATCH else colab_default)
+    if using_public_pcqm_hiv_pre():
+        return os.environ.get(name, colab_default)
     if using_paper_table() and EXACT_PAPER_CONFIG:
         return paper_table_default if EXACT_PAPER_BATCH else colab_default
     return os.environ.get(name, colab_default)
@@ -235,7 +293,7 @@ def batch_value(
 # Training defaults.
 SEEDS = os.environ.get("SEEDS", "1")
 N_GPU = config_value("N_GPU", "1", "1", "1")
-PAPER_EPOCHS = config_value("PAPER_EPOCHS", "4", "4", "8")
+PAPER_EPOCHS = config_value("PAPER_EPOCHS", "20", "4", "8")
 TRAIN_SIZE_APPROX = config_value("TRAIN_SIZE_APPROX", "33000", "33000", "33000")
 EFFECTIVE_BATCH_SIZE = config_value("EFFECTIVE_BATCH_SIZE", "128", "128", "128")
 MICRO_BATCH_SIZE = batch_value("MICRO_BATCH_SIZE", "32", "128", "128")
@@ -260,7 +318,7 @@ KEEP_INTERVAL_UPDATES = os.environ.get("KEEP_INTERVAL_UPDATES", "-1")
 # Plain PCQM4Mv1/PCQM4Mv2 checkpoints remain opt-in analysis/ablation variants.
 PRETRAINED_MODEL_NAME = config_value(
     "PRETRAINED_MODEL_NAME",
-    "pcqm4mv1_graphormer_base_for_molhiv",
+    "pcqm4mv2_graphormer_base",
     "pcqm4mv1_graphormer_base_for_molhiv",
     "pcqm4mv1_graphormer_base",
 )
@@ -271,6 +329,8 @@ if using_microsoft_hiv_pre():
         PRE_LAYERNORM_ARG = os.environ.get("PRE_LAYERNORM_ARG", "--pre-layernorm")
 elif using_paper_table() and EXACT_PAPER_CONFIG:
     PRE_LAYERNORM_ARG = ""
+elif using_public_pcqm_hiv_pre():
+    PRE_LAYERNORM_ARG = os.environ.get("PRE_LAYERNORM_ARG", "")
 else:
     PRE_LAYERNORM_ARG = os.environ.get(
         "PRE_LAYERNORM_ARG",
@@ -299,7 +359,9 @@ def reload_config_from_env() -> None:
     global TORCH_HOME, PRETRAINED_CACHE_DRIVE, GRAPHORMER_COMMIT, PYTORCH_WHEEL_URL
     global PYG_WHEEL_URL, DGL_WHEEL_URL, GRAPHORMER_GIT_URL, ANALYSIS_REPO_DIR
     global ANALYSIS_REPO_URL, PYPI_SIMPLE_URL, HF_PCQM4MV1_PYTORCH_URL
-    global HF_PCQM4MV2_PYTORCH_URL, CONFIG_PRESET, STRICT_MICROSOFT_CONFIG
+    global HF_PCQM4MV2_PYTORCH_URL, MOLHIV_PRETRAINED_URL, MOLHIV_PRETRAINED_ALT_URLS
+    global MOLHIV_PRETRAINED_LOCAL_PATH, PRETRAINED_MODEL_URL_OVERRIDE
+    global SKIP_PRETRAINED_SOURCE_PREFLIGHT, CONFIG_PRESET, STRICT_MICROSOFT_CONFIG
     global EXACT_PAPER_CONFIG, EXACT_PAPER_BATCH
     global SEEDS, N_GPU, PAPER_EPOCHS, TRAIN_SIZE_APPROX, EFFECTIVE_BATCH_SIZE
     global MICRO_BATCH_SIZE, UPDATE_FREQ
@@ -361,16 +423,33 @@ def reload_config_from_env() -> None:
         "https"
         + "://huggingface.co/clefourrier/graphormer-base-pcqm4mv2/resolve/refs%2Fpr%2F4/pytorch_model.bin",
     )
+    MOLHIV_PRETRAINED_URL = os.environ.get(
+        "MOLHIV_PRETRAINED_URL",
+        "https"
+        + "://ml2md.blob.core.windows.net/graphormer-ckpts/"
+        + MOLHIV_PRETRAINED_CANONICAL_FILENAME,
+    )
+    MOLHIV_PRETRAINED_ALT_URLS = os.environ.get(
+        "MOLHIV_PRETRAINED_ALT_URLS",
+        "https"
+        + "://szheng.blob.core.windows.net/graphormer/modelzoo/pcqm4mv1/"
+        + MOLHIV_PRETRAINED_CANONICAL_FILENAME,
+    )
+    MOLHIV_PRETRAINED_LOCAL_PATH = os.environ.get("MOLHIV_PRETRAINED_LOCAL_PATH", "")
+    PRETRAINED_MODEL_URL_OVERRIDE = os.environ.get("PRETRAINED_MODEL_URL_OVERRIDE", "")
+    SKIP_PRETRAINED_SOURCE_PREFLIGHT = env_bool("SKIP_PRETRAINED_SOURCE_PREFLIGHT", False)
 
     CONFIG_PRESET = os.environ.get(
-        "CONFIG_PRESET", os.environ.get("REPRODUCTION_CONFIG", "microsoft_hiv_pre")
+        "CONFIG_PRESET", os.environ.get("REPRODUCTION_CONFIG", "public_pcqm_hiv_pre")
     ).strip().lower()
-    STRICT_MICROSOFT_CONFIG = env_bool("STRICT_MICROSOFT_CONFIG", True)
+    STRICT_MICROSOFT_CONFIG = env_bool(
+        "STRICT_MICROSOFT_CONFIG", CONFIG_PRESET in MICROSOFT_PRESETS
+    )
     EXACT_PAPER_CONFIG = env_bool("EXACT_PAPER_CONFIG", False)
-    EXACT_PAPER_BATCH = env_bool("EXACT_PAPER_BATCH", True)
+    EXACT_PAPER_BATCH = env_bool("EXACT_PAPER_BATCH", CONFIG_PRESET in MICROSOFT_PRESETS)
     SEEDS = os.environ.get("SEEDS", "1")
     N_GPU = config_value("N_GPU", "1", "1", "1")
-    PAPER_EPOCHS = config_value("PAPER_EPOCHS", "4", "4", "8")
+    PAPER_EPOCHS = config_value("PAPER_EPOCHS", "20", "4", "8")
     TRAIN_SIZE_APPROX = config_value("TRAIN_SIZE_APPROX", "33000", "33000", "33000")
     EFFECTIVE_BATCH_SIZE = config_value("EFFECTIVE_BATCH_SIZE", "128", "128", "128")
     MICRO_BATCH_SIZE = batch_value("MICRO_BATCH_SIZE", "32", "128", "128")
@@ -392,7 +471,7 @@ def reload_config_from_env() -> None:
     KEEP_INTERVAL_UPDATES = os.environ.get("KEEP_INTERVAL_UPDATES", "-1")
     PRETRAINED_MODEL_NAME = config_value(
         "PRETRAINED_MODEL_NAME",
-        "pcqm4mv1_graphormer_base_for_molhiv",
+        "pcqm4mv2_graphormer_base",
         "pcqm4mv1_graphormer_base_for_molhiv",
         "pcqm4mv1_graphormer_base",
     )
@@ -403,6 +482,8 @@ def reload_config_from_env() -> None:
             PRE_LAYERNORM_ARG = os.environ.get("PRE_LAYERNORM_ARG", "--pre-layernorm")
     elif using_paper_table() and EXACT_PAPER_CONFIG:
         PRE_LAYERNORM_ARG = ""
+    elif using_public_pcqm_hiv_pre():
+        PRE_LAYERNORM_ARG = os.environ.get("PRE_LAYERNORM_ARG", "")
     else:
         PRE_LAYERNORM_ARG = os.environ.get(
             "PRE_LAYERNORM_ARG",
@@ -458,6 +539,14 @@ def show_runtime() -> None:
     print("Drive run root:", DRIVE_RUN_ROOT, flush=True)
     print("Torch cache:", TORCH_HOME, flush=True)
     print("Drive pretrained cache:", PRETRAINED_CACHE_DRIVE, flush=True)
+    if PRETRAINED_MODEL_NAME == "pcqm4mv1_graphormer_base_for_molhiv":
+        print(
+            "Expected MolHIV pretrained checkpoint:",
+            PRETRAINED_CACHE_DRIVE / MOLHIV_PRETRAINED_CANONICAL_FILENAME,
+            flush=True,
+        )
+        if MOLHIV_PRETRAINED_LOCAL_PATH:
+            print("MolHIV pretrained local override:", MOLHIV_PRETRAINED_LOCAL_PATH, flush=True)
     print("Drive sync interval seconds:", SYNC_INTERVAL_SECONDS, flush=True)
     print("Config preset:", CONFIG_PRESET, flush=True)
     print("Strict Microsoft config:", STRICT_MICROSOFT_CONFIG, flush=True)
@@ -492,6 +581,44 @@ def show_runtime() -> None:
 def validate_config_alignment() -> None:
     """Fail fast when strict Microsoft MolHIV reproduction settings drift."""
     if not using_microsoft_hiv_pre():
+        if using_public_pcqm_hiv_pre():
+            expected = {
+                "PRE_LAYERNORM_ARG": (PRE_LAYERNORM_ARG, ""),
+                "PAPER_EPOCHS": (PAPER_EPOCHS, "20"),
+                "EFFECTIVE_BATCH_SIZE": (EFFECTIVE_BATCH_SIZE, "128"),
+                "MICRO_BATCH_SIZE": (MICRO_BATCH_SIZE, "32"),
+                "UPDATE_FREQ": (UPDATE_FREQ, "4"),
+                "WARMUP_RATIO": (WARMUP_RATIO, "0.16"),
+                "PEAK_LEARNING_RATE": (PEAK_LEARNING_RATE, "2e-4"),
+                "END_LEARNING_RATE": (END_LEARNING_RATE, "1e-5"),
+                "DROPOUT": (DROPOUT, "0.0"),
+                "FLAG_M": (FLAG_M, "3"),
+                "FLAG_STEP_SIZE": (FLAG_STEP_SIZE, "0.01"),
+                "FLAG_MAG": (FLAG_MAG, "0"),
+            }
+            mismatches = [
+                f"{name}: got {actual!r}, expected {want!r}"
+                for name, (actual, want) in expected.items()
+                if str(actual) != str(want)
+            ]
+            if mismatches:
+                raise RuntimeError(
+                    "Public PCQM MolHIV fine-tune config drift detected:\n"
+                    + "\n".join(mismatches)
+                )
+            allowed_pretrained = {"pcqm4mv2_graphormer_base", "pcqm4mv1_graphormer_base"}
+            if PRETRAINED_MODEL_NAME not in allowed_pretrained:
+                raise RuntimeError(
+                    "Public PCQM MolHIV fine-tune must use pcqm4mv2_graphormer_base "
+                    f"or backup pcqm4mv1_graphormer_base, got {PRETRAINED_MODEL_NAME!r}"
+                )
+            print(
+                "Public PCQM MolHIV fine-tune config check passed. "
+                "Primary max-AUC run uses PCQM4Mv2; PCQM4Mv1 is allowed only as backup. "
+                "This is not exact Microsoft hiv_pre.sh initialization.",
+                flush=True,
+            )
+            return
         print(f"Non-Microsoft config preset selected: {CONFIG_PRESET}", flush=True)
         return
     if not STRICT_MICROSOFT_CONFIG:
@@ -535,6 +662,72 @@ def validate_config_alignment() -> None:
             flush=True,
         )
     print("Strict Microsoft MolHIV config alignment check passed.", flush=True)
+
+
+def _candidate_molhiv_pretrained_urls() -> list[str]:
+    urls: list[str] = []
+    for raw in [PRETRAINED_MODEL_URL_OVERRIDE, MOLHIV_PRETRAINED_URL, MOLHIV_PRETRAINED_ALT_URLS]:
+        for url in str(raw or "").split(","):
+            url = url.strip()
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def preflight_pretrained_source() -> None:
+    """Catch dead public checkpoint URLs before spending time on Colab setup."""
+    if (
+        PRETRAINED_MODEL_NAME != "pcqm4mv1_graphormer_base_for_molhiv"
+        or SKIP_PRETRAINED_SOURCE_PREFLIGHT
+        or not (RUN_SETUP or RUN_TRAIN or VALIDATE_PRETRAINED_LOAD)
+    ):
+        return
+
+    drive_path = PRETRAINED_CACHE_DRIVE / MOLHIV_PRETRAINED_CANONICAL_FILENAME
+    local_cache_path = TORCH_HOME / "hub" / "checkpoints" / MOLHIV_PRETRAINED_CANONICAL_FILENAME
+    manual_paths = [
+        Path(path).expanduser()
+        for path in [
+            MOLHIV_PRETRAINED_LOCAL_PATH,
+            os.environ.get("PRETRAINED_CHECKPOINT_LOCAL_PATH", ""),
+            os.environ.get("PRETRAINED_CHECKPOINT_PATH", ""),
+        ]
+        if str(path).strip()
+    ]
+    for path in [*manual_paths, drive_path, local_cache_path]:
+        if path.is_file() and path.stat().st_size > 1_000_000:
+            print(f"Pretrained MolHIV checkpoint source found locally: {path}", flush=True)
+            return
+
+    errors: list[str] = []
+    for url in _candidate_molhiv_pretrained_urls():
+        try:
+            request = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(request, timeout=20) as response:
+                status = getattr(response, "status", 200)
+                if 200 <= status < 400:
+                    print(f"Pretrained MolHIV checkpoint URL is reachable: {url}", flush=True)
+                    return
+                errors.append(f"{url} -> HTTP {status}")
+        except Exception as exc:
+            errors.append(f"{url} -> {type(exc).__name__}: {exc}")
+
+    error_lines = "\n".join(f"  - {line}" for line in errors)
+    raise RuntimeError(
+        "The Microsoft MolHIV pretrained checkpoint is not available from this runtime.\n"
+        "This is the checkpoint required for strict Microsoft hiv_pre.sh reproduction:\n"
+        f"  {MOLHIV_PRETRAINED_CANONICAL_FILENAME}\n\n"
+        "Checked local/cache paths:\n"
+        f"  - {drive_path}\n"
+        f"  - {local_cache_path}\n"
+        + "".join(f"  - {path}\n" for path in manual_paths)
+        + "\nChecked public URLs:\n"
+        + error_lines
+        + "\n\n"
+        "Fix: place the checkpoint file in the Drive cache path above, or set "
+        "MOLHIV_PRETRAINED_LOCAL_PATH / PRETRAINED_CHECKPOINT_LOCAL_PATH to a valid copy. "
+        "The runner will validate and mirror it before training."
+    )
 
 
 def analysis_pcqm_smoke_test() -> None:
@@ -958,17 +1151,43 @@ if name == "none":
 if name not in PRETRAINED_MODEL_URLS:
     raise RuntimeError(f"Unknown pretrained model: {name}")
 
-official_url = PRETRAINED_MODEL_URLS[name]
+canonical_url = PRETRAINED_MODEL_URLS[name]
+canonical_filename = os.path.basename(urlparse(canonical_url).path)
+official_urls = []
+for raw in [os.environ.get("PRETRAINED_MODEL_URL_OVERRIDE", ""), canonical_url]:
+    raw = raw.strip()
+    if raw and raw not in official_urls:
+        official_urls.append(raw)
 if name == "pcqm4mv1_graphormer_base_for_molhiv":
-    official_url = os.environ.get("MOLHIV_PRETRAINED_URL", official_url)
-official_url = os.environ.get("PRETRAINED_MODEL_URL_OVERRIDE", official_url)
-filename = os.path.basename(urlparse(official_url).path)
+    official_urls = []
+    for raw in [
+        os.environ.get("PRETRAINED_MODEL_URL_OVERRIDE", ""),
+        os.environ.get("MOLHIV_PRETRAINED_URL", canonical_url),
+        os.environ.get("MOLHIV_PRETRAINED_ALT_URLS", ""),
+        canonical_url,
+    ]:
+        for url in raw.split(","):
+            url = url.strip()
+            if url and url not in official_urls:
+                official_urls.append(url)
+    canonical_filename = "checkpoint_base_preln_pcqm4mv1_for_hiv.pt"
+filename = canonical_filename
 cache_dir = Path(os.environ["TORCH_HOME"]) / "hub" / "checkpoints"
 cache_dir.mkdir(parents=True, exist_ok=True)
 local_path = cache_dir / filename
 drive_dir = Path(os.environ["PRETRAINED_CACHE_DRIVE"])
 drive_dir.mkdir(parents=True, exist_ok=True)
 drive_path = drive_dir / filename
+
+manual_paths = []
+for raw in [
+    os.environ.get("MOLHIV_PRETRAINED_LOCAL_PATH", ""),
+    os.environ.get("PRETRAINED_CHECKPOINT_LOCAL_PATH", ""),
+    os.environ.get("PRETRAINED_CHECKPOINT_PATH", ""),
+]:
+    raw = raw.strip()
+    if raw:
+        manual_paths.append(Path(raw).expanduser())
 
 try:
     n_gpu = max(1, int(os.environ.get("N_GPU", "1")))
@@ -1137,7 +1356,7 @@ def convert_hf_graphormer_checkpoint(hf_path: Path, output_path: Path, hf_url: s
 
 
 restored = False
-for candidate in [drive_path, *rank_drive_paths, local_path, *rank_cache_paths]:
+for candidate in [*manual_paths, drive_path, *rank_drive_paths, local_path, *rank_cache_paths]:
     if candidate.exists() and copy_if_valid(candidate, local_path):
         print(f"Restored pretrained checkpoint from {candidate}")
         restored = True
@@ -1145,9 +1364,11 @@ for candidate in [drive_path, *rank_drive_paths, local_path, *rank_cache_paths]:
 
 if not restored:
     official_ready = False
-    if download_with_retries(official_url, local_path, "official Graphormer checkpoint"):
-        official_ready = valid_checkpoint(local_path)
-        if not official_ready:
+    for official_url in official_urls:
+        if download_with_retries(official_url, local_path, "official Graphormer checkpoint"):
+            official_ready = valid_checkpoint(local_path)
+            if official_ready:
+                break
             print(f"Official checkpoint downloaded but failed validation: {local_path}")
             local_path.unlink(missing_ok=True)
     hf_fallback_urls = {
@@ -1169,8 +1390,11 @@ if not restored:
             raise RuntimeError(f"HF-converted checkpoint failed validation: {local_path}")
     elif not official_ready:
         raise RuntimeError(
-            f"Could not download official checkpoint for {name}, and no HF fallback is configured. "
-            f"Place a valid checkpoint at {drive_path} or use pcqm4mv1_graphormer_base/pcqm4mv2_graphormer_base."
+            f"Could not download official checkpoint for {name}. The MolHIV-specific "
+            "pre-layernorm checkpoint is required for strict Microsoft hiv_pre.sh reproduction "
+            "and no official Hugging Face mirror is known. "
+            f"Place a valid checkpoint at {drive_path}, set MOLHIV_PRETRAINED_LOCAL_PATH, "
+            "or set PRETRAINED_CHECKPOINT_LOCAL_PATH to a valid copy."
         )
 
 mirror_cache_files()
@@ -1252,7 +1476,7 @@ else
   EXPECTED_INTERVAL_CKPTS=0
 fi
 
-echo "[graphormer-colab] Training target: Microsoft hiv_pre.sh MolHIV Graphormer-FLAG"
+echo "[graphormer-colab] Training target: $CONFIG_PRESET MolHIV Graphormer-FLAG"
 echo "[graphormer-colab] pretrained=$PRETRAINED_MODEL_NAME epochs=$PAPER_EPOCHS batch=$MICRO_BATCH_SIZE update_freq=$UPDATE_FREQ effective_batch=$EFFECTIVE_BATCH_SIZE"
 echo "[graphormer-colab] warmup_updates=$WARMUP_UPDATES total_updates=$TOT_UPDATES lr=$PEAK_LEARNING_RATE->$END_LEARNING_RATE dropout=$DROPOUT attn_dropout=$ATTENTION_DROPOUT flag_m=$FLAG_M flag_step=$FLAG_STEP_SIZE flag_mag=$FLAG_MAG"
 echo "[graphormer-colab] config_preset=$CONFIG_PRESET strict_microsoft_config=$STRICT_MICROSOFT_CONFIG exact_paper_batch=$EXACT_PAPER_BATCH force_retrain=$FORCE_RETRAIN archive_existing_run=$ARCHIVE_EXISTING_RUN save_interval_updates=$SAVE_INTERVAL_UPDATES"
@@ -1263,7 +1487,11 @@ if [ -n "$PRE_LAYERNORM_ARG" ]; then
 fi
 
 for SEED in "${SEED_ARRAY[@]}"; do
-  RUN_NAME="official_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  if [ "$CONFIG_PRESET" = "public_hiv_pre_fallback" ] || [ "$CONFIG_PRESET" = "public_pcqm_hiv_pre" ] || [ "$CONFIG_PRESET" = "pcqm_hiv_pre" ]; then
+    RUN_NAME="public_pcqm_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  else
+    RUN_NAME="official_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  fi
   LOCAL_RUN_DIR="$LOCAL_RUN_ROOT/${RUN_NAME}"
   DRIVE_RUN_DIR="$DRIVE_RUN_ROOT/${RUN_NAME}"
   SAVE_DIR="$LOCAL_RUN_DIR/ckpts"
@@ -1295,7 +1523,7 @@ for SEED in "${SEED_ARRAY[@]}"; do
 
   cat > "$LOCAL_RUN_DIR/run_config.txt" <<EOF
 run_name=$RUN_NAME
-target=graphormer_microsoft_hiv_pre_molhiv_graphormer_flag_80_51_auc
+target=$CONFIG_PRESET
 config_preset=$CONFIG_PRESET
 strict_microsoft_config=$STRICT_MICROSOFT_CONFIG
 exact_paper_config=$EXACT_PAPER_CONFIG
@@ -1535,7 +1763,11 @@ if [ -n "$PRE_LAYERNORM_ARG" ]; then
 fi
 
 for SEED in "${SEED_ARRAY[@]}"; do
-  RUN_NAME="official_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  if [ "$CONFIG_PRESET" = "public_hiv_pre_fallback" ] || [ "$CONFIG_PRESET" = "public_pcqm_hiv_pre" ] || [ "$CONFIG_PRESET" = "pcqm_hiv_pre" ]; then
+    RUN_NAME="public_pcqm_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  else
+    RUN_NAME="official_molhiv_${PRETRAINED_MODEL_NAME}_seed${SEED}"
+  fi
   LOCAL_RUN_DIR="$LOCAL_RUN_ROOT/${RUN_NAME}"
   DRIVE_RUN_DIR="$DRIVE_RUN_ROOT/${RUN_NAME}"
   SAVE_DIR="$LOCAL_RUN_DIR/ckpts"
@@ -1640,6 +1872,78 @@ print("[graphormer-colab] Copied best-by-valid-AUC checkpoint to:", best_copy)
 print("[graphormer-colab] Wrote AUC summary:", summary)
 PY
 
+  BEST_SINGLE_EVAL_DIR="$LOCAL_RUN_DIR/best_valid_auc_eval_ckpt"
+  rm -rf "$BEST_SINGLE_EVAL_DIR"
+  mkdir -p "$BEST_SINGLE_EVAL_DIR"
+  cp "$SAVE_DIR/checkpoint_best_valid_auc.pt" "$BEST_SINGLE_EVAL_DIR/checkpoint_best_valid_auc.pt"
+
+  for SPLIT in train valid test; do
+    CUDA_VISIBLE_DEVICES=0 python "$GRAPHORMER_DIR/graphormer/evaluate/evaluate.py" \
+      --user-dir "$GRAPHORMER_DIR/graphormer" \
+      --num-workers "$NUM_WORKERS" \
+      --ddp-backend=legacy_ddp \
+      --dataset-name ogbg-molhiv \
+      --dataset-source ogb \
+      --task graph_prediction \
+      --arch graphormer_base \
+      --num-classes 1 \
+      --batch-size "$EVAL_BATCH_SIZE" \
+      --save-dir "$BEST_SINGLE_EVAL_DIR" \
+      --split "$SPLIT" \
+      --metric auc \
+      --seed "$SEED" \
+      "${PRE_LAYERNORM_ARGS[@]}" \
+      --log-format simple --log-interval 100 2>&1 | tee "$LOG_DIR/eval_best_valid_auc_${SPLIT}.log"
+  done
+
+  export LOG_DIR LOCAL_RUN_DIR
+  python - <<'PY'
+import os
+import re
+from pathlib import Path
+
+log_dir = Path(os.environ["LOG_DIR"])
+run_dir = Path(os.environ["LOCAL_RUN_DIR"])
+rows = []
+for split in ("train", "valid", "test"):
+    path = log_dir / f"eval_best_valid_auc_{split}.log"
+    auc = None
+    if path.is_file():
+        for line in path.read_text(errors="replace").splitlines():
+            match = re.search(r"\bauc: ([0-9.eE+-]+)", line)
+            if match:
+                auc = float(match.group(1))
+    if auc is None:
+        raise SystemExit(f"No AUC found in {path}")
+    rows.append((split, auc))
+
+summary = run_dir / "best_valid_auc_train_valid_test.tsv"
+with summary.open("w") as handle:
+    handle.write("split\tauc\n")
+    for split, auc in rows:
+        handle.write(f"{split}\t{auc:.12g}\n")
+
+valid_auc = dict(rows)["valid"]
+test_auc = dict(rows)["test"]
+if valid_auc >= 0.78 and test_auc >= 0.78:
+    interpretation = "strong_for_specialisation_analysis"
+elif valid_auc >= 0.72 and test_auc >= 0.72:
+    interpretation = "borderline_consider_pcqm4mv1_backup_or_more_epochs"
+else:
+    interpretation = "underperforming_stop_and_inspect_checkpoint_loading"
+(run_dir / "best_valid_auc_interpretation.txt").write_text(
+    f"valid_auc={valid_auc:.12g}\n"
+    f"test_auc={test_auc:.12g}\n"
+    f"interpretation={interpretation}\n"
+)
+
+print("[graphormer-colab] Best-valid checkpoint train/valid/test AUC:")
+for split, auc in rows:
+    print(f"[graphormer-colab]   {split}: {auc:.6f}")
+print("[graphormer-colab] Interpretation:", interpretation)
+print("[graphormer-colab] Wrote best checkpoint split summary:", summary)
+PY
+
   mkdir -p "$DRIVE_RUN_DIR"
   {
     echo -e "filename\tbytes\tmodified_utc"
@@ -1687,6 +1991,14 @@ def common_env() -> dict[str, str]:
         "PRETRAINED_CACHE_DRIVE": str(PRETRAINED_CACHE_DRIVE),
         "HF_PCQM4MV1_PYTORCH_URL": HF_PCQM4MV1_PYTORCH_URL,
         "HF_PCQM4MV2_PYTORCH_URL": HF_PCQM4MV2_PYTORCH_URL,
+        "MOLHIV_PRETRAINED_URL": MOLHIV_PRETRAINED_URL,
+        "MOLHIV_PRETRAINED_ALT_URLS": MOLHIV_PRETRAINED_ALT_URLS,
+        "MOLHIV_PRETRAINED_LOCAL_PATH": MOLHIV_PRETRAINED_LOCAL_PATH,
+        "PRETRAINED_MODEL_URL_OVERRIDE": PRETRAINED_MODEL_URL_OVERRIDE,
+        "PRETRAINED_CHECKPOINT_LOCAL_PATH": os.environ.get(
+            "PRETRAINED_CHECKPOINT_LOCAL_PATH", ""
+        ),
+        "PRETRAINED_CHECKPOINT_PATH": os.environ.get("PRETRAINED_CHECKPOINT_PATH", ""),
         "CONFIG_PRESET": CONFIG_PRESET,
         "STRICT_MICROSOFT_CONFIG": "1" if STRICT_MICROSOFT_CONFIG else "0",
         "EXACT_PAPER_CONFIG": "1" if EXACT_PAPER_CONFIG else "0",
@@ -1727,6 +2039,7 @@ def main(overrides: dict[str, object] | None = None) -> None:
     mount_drive()
     show_runtime()
     validate_config_alignment()
+    preflight_pretrained_source()
     if RUN_ANALYSIS_PCQM_SMOKE_TEST:
         analysis_pcqm_smoke_test()
     if RUN_SETUP:
